@@ -1,4 +1,4 @@
-name: 清理旧发布和标签 (ImmortalWrt-24.10)
+name: 清理旧 ImmortalWrt-24.10 Releases 和 Tags
 
 on:
   workflow_dispatch:
@@ -9,145 +9,159 @@ on:
         required: true
         default: false
       retain_count:
-        description: '保留最新的 Release 和 Tag 数量（0 = 全删，建议 3~10）'
+        description: '保留最新的 Release 数量（0=全删，推荐3~10）'
         type: string
         required: false
-        default: '3'
+        default: '5'
 
 permissions:
-  contents: write   # 必须有 write 权限才能删除 release 和 tag
+  contents: write
 
 jobs:
-  clean-old-releases-and-tags:
+  cleanup:
     runs-on: ubuntu-latest
     if: github.event.inputs.confirm_cleanup == 'true'
 
     steps:
-      - name: 检出代码（其实这里不需要，但保持习惯）
-        uses: actions/checkout@v4
-
-      - name: 安装必要工具
+      - name: 安装工具
         run: |
           sudo apt-get update
           sudo apt-get install -y gh jq
           gh --version
           jq --version
 
-      - name: 解析并验证保留数量
-        id: set-retain
+      - name: 设置保留数量
+        id: params
         run: |
           RETAIN="${{ github.event.inputs.retain_count }}"
           if ! [[ "$RETAIN" =~ ^[0-9]+$ ]] || [ "$RETAIN" -lt 0 ]; then
-            echo "输入的保留数量无效（$RETAIN），强制使用 3"
-            RETAIN=3
+            echo "无效的保留数量 '$RETAIN'，强制使用 5"
+            RETAIN=5
           fi
           echo "retain=$RETAIN" >> $GITHUB_OUTPUT
           echo "将保留最新的 $RETAIN 个 Release / Tag"
 
-      - name: 清理旧 Releases（并自动删除关联 Tag）
+      - name: 清理旧 Releases（自动删除关联 Tag）
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
 
-          RETAIN=${{ steps.set-retain.outputs.retain }}
+          RETAIN=${{ steps.params.outputs.retain }}
 
-          echo "获取所有 ImmortalWrt-24.10 相关的 Releases（按创建时间降序）..."
-          # 使用 gh release list + json 更可靠，也支持 --limit
-          RELEASE_JSON=$(gh release list --json tagName,name,createdAt --jq '
+          echo "获取所有 ImmortalWrt-24.10 Releases（按创建时间降序）..."
+          RELEASES_JSON=$(gh release list --json tagName,name,createdAt --limit 1000 --jq '
             sort_by(.createdAt) | reverse |
             map(select(.name | test("ImmortalWrt-24.10"; "i")))
-          ' --limit 500)  # 一般够用，如超多可再分页
+          ') || {
+            echo "gh release list 失败，可能无权限或网络问题"
+            exit 1
+          }
 
-          if [ "$(echo "$RELEASE_JSON" | jq length)" -eq 0 ]; then
-            echo "没有找到符合条件的 Release，跳过"
+          COUNT=$(echo "$RELEASES_JSON" | jq 'length' || echo 0)
+          echo "找到 $COUNT 个匹配的 Releases"
+
+          if [ "$COUNT" -eq 0 ]; then
+            echo "没有匹配的 Release，跳过删除"
             exit 0
           fi
 
-          echo "找到的 Releases（最新在前）："
-          echo "$RELEASE_JSON" | jq -r '.[].name'
+          echo "$RELEASES_JSON" | jq -r '.[].name'
 
-          # 待删除的 Releases（从第 RETAIN+1 个开始）
-          TO_DELETE=$(echo "$RELEASE_JSON" | jq -r '.[env.RETAIN | tonumber:] | .[].tagName')
+          # 安全切片：如果 RETAIN >= COUNT，则 TO_DELETE 为空
+          TO_DELETE=$(echo "$RELEASES_JSON" | jq -r --argjson r "$RETAIN" '
+            if $r >= length then empty
+            else .[$r:][] | .tagName
+            end
+          ' || echo "")
 
           if [ -z "$TO_DELETE" ]; then
-            echo "无需删除任何 Release（已 ≤ $RETAIN 个）"
+            echo "无需删除（实际数量 ≤ $RETAIN）"
           else
-            echo "即将删除以下 Release（及其 Tag）："
-            echo "$TO_DELETE" | tr ' ' '\n'
+            echo "待删除的 tag_names（及其 Release）："
+            echo "$TO_DELETE" | tr ' ' '\n' || echo "$TO_DELETE"
 
             echo "$TO_DELETE" | while read -r tag; do
-              if [ -n "$tag" ]; then
-                echo "删除 Release + Tag: $tag"
-                for try in {1..3}; do
-                  gh release delete "$tag" --cleanup-tag --yes && break
-                  echo "第 $try 次失败，重试..."
-                  sleep $((try*3))
-                done || echo "!!! 删除 $tag 失败，请手动检查"
-              fi
+              [ -z "$tag" ] && continue
+              echo "删除 Release + Tag: $tag"
+              for try in {1..3}; do
+                gh release delete "$tag" --cleanup-tag --yes && {
+                  echo "成功删除 $tag"
+                  break
+                }
+                echo "尝试 $try/3 失败，重试..."
+                sleep $((try * 3))
+              done || echo "删除 $tag 失败（可能已不存在或权限问题）"
             done
           fi
 
-      - name: 清理孤立 Tags（不关联任何 Release 的 ImmortalWrt-24.10 tag）
+      - name: 清理孤立 Tags（不属于任何 Release 的 ImmortalWrt-24.10 tag）
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
 
-          echo "获取所有 ImmortalWrt-24.10 相关的 Tags..."
-          TAGS_JSON=$(gh api repos/${{ github.repository }}/tags --paginate --jq '
-            sort_by(.commit.author.date) | reverse |
+          echo "获取所有 ImmortalWrt-24.10 Tags..."
+          TAGS_JSON=$(gh api --paginate repos/${{ github.repository }}/tags --jq '
             map(select(.name | test("immortalwrt-24.10"; "i")))
-          ')
+          ') || {
+            echo "获取 Tags 失败"
+            exit 1
+          }
 
-          if [ "$(echo "$TAGS_JSON" | jq length)" -eq 0 ]; then
-            echo "没有找到符合条件的 Tag，跳过"
+          TAG_COUNT=$(echo "$TAGS_JSON" | jq 'length' || echo 0)
+          echo "找到 $TAG_COUNT 个匹配的 Tags"
+
+          if [ "$TAG_COUNT" -eq 0 ]; then
+            echo "没有匹配的 Tag，跳过"
             exit 0
           fi
 
-          # 当前剩余的 Release tags（已保留的）
-          CURRENT_RELEASE_TAGS=$(gh release list --json tagName --jq '.[].tagName' | sort | uniq)
+          # 当前所有 Release 的 tag_name（已保留或全部）
+          CURRENT_TAGS=$(gh release list --json tagName --jq '.[].tagName' | sort -u || echo "")
 
-          echo "当前存在的 Release 关联的 Tags："
-          echo "$CURRENT_RELEASE_TAGS"
+          echo "当前 Release 关联的 Tags："
+          echo "$CURRENT_TAGS" || echo "无"
 
-          # 找出需要删除的孤立 tag
-          TO_DELETE_TAGS=""
-          while read -r tag; do
-            if ! echo "$CURRENT_RELEASE_TAGS" | grep -q "^$tag$"; then
-              TO_DELETE_TAGS="$TO_DELETE_TAGS $tag"
-            fi
-          done < <(echo "$TAGS_JSON" | jq -r '.[].name')
+          # 找出孤立 tag
+          TO_DELETE_TAGS=$(echo "$TAGS_JSON" | jq -r --argjson current "$(echo "$CURRENT_TAGS" | jq -R .)" '
+            .[] | .name as $n |
+            if ($current | index($n)) then empty else $n end
+          ' || echo "")
 
           if [ -z "$TO_DELETE_TAGS" ]; then
-            echo "没有孤立的 Tag 需要清理"
+            echo "没有孤立 Tag 需要删除"
           else
-            echo "即将删除以下孤立 Tags："
+            echo "待删除的孤立 Tags："
             echo "$TO_DELETE_TAGS" | tr ' ' '\n'
 
-            for tag in $TO_DELETE_TAGS; do
+            echo "$TO_DELETE_TAGS" | while read -r tag; do
+              [ -z "$tag" ] && continue
               echo "删除 Tag: $tag"
               for try in {1..4}; do
-                gh api -X DELETE "repos/${{ github.repository }}/git/refs/tags/$tag" && break
-                echo "第 $try 次失败，重试..."
-                sleep $((try*4))
-              done || echo "!!! 删除 Tag $tag 失败"
+                gh api -X DELETE "repos/${{ github.repository }}/git/refs/tags/$tag" && {
+                  echo "成功删除 $tag"
+                  break
+                }
+                echo "尝试 $try/4 失败，重试..."
+                sleep $((try * 4))
+              done || echo "删除 Tag $tag 失败（可能已不存在）"
             done
           fi
 
-      - name: 输出最终状态（验证用）
+      - name: 显示最终状态（验证）
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          echo "=== 清理后状态 ==="
-          echo "剩余 Releases:"
-          gh release list --json name,tagName,createdAt --jq '
+          echo "=== 清理完成后状态 ==="
+          echo "剩余 ImmortalWrt-24.10 Releases（前10个）："
+          gh release list --json name,tagName,createdAt --limit 10 --jq '
             sort_by(.createdAt) | reverse |
-            map(select(.name | test("ImmortalWrt-24.10"; "i"))) | .[:10]
+            map(select(.name | test("ImmortalWrt-24.10"; "i")))
           ' || echo "无"
 
-          echo -e "\n剩余 Tags (前10个):"
+          echo -e "\n剩余 ImmortalWrt-24.10 Tags（前10个）："
           gh api repos/${{ github.repository }}/tags --jq '
-            sort_by(.commit.author.date) | reverse |
-            map(select(.name | test("immortalwrt-24.10"; "i"))) | .[:10] | .[].name
+            map(select(.name | test("immortalwrt-24.10"; "i"))) |
+            sort_by(.commit.author.date) | reverse | .[:10] | .[].name
           ' || echo "无"
