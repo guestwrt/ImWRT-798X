@@ -23,6 +23,11 @@ jobs:
     if: github.event.inputs.confirm_cleanup == 'true'
 
     steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # 可选：如果后续需要 git log 或其他历史，可保留完整历史
+
       - name: 安装工具
         run: |
           sudo apt-get update
@@ -39,7 +44,7 @@ jobs:
             RETAIN=5
           fi
           echo "retain=$RETAIN" >> $GITHUB_OUTPUT
-          echo "将保留最新的 $RETAIN 个 Release / Tag"
+          echo "将保留最新的 $RETAIN 个 Release"
 
       - name: 清理旧 Releases（自动删除关联 Tag）
         env:
@@ -54,7 +59,7 @@ jobs:
             sort_by(.createdAt) | reverse |
             map(select(.name | test("ImmortalWrt-24.10"; "i")))
           ') || {
-            echo "gh release list 失败，可能无权限或网络问题"
+            echo "gh release list 失败"
             exit 1
           }
 
@@ -68,7 +73,6 @@ jobs:
 
           echo "$RELEASES_JSON" | jq -r '.[].name'
 
-          # 安全切片：如果 RETAIN >= COUNT，则 TO_DELETE 为空
           TO_DELETE=$(echo "$RELEASES_JSON" | jq -r --argjson r "$RETAIN" '
             if $r >= length then empty
             else .[$r:][] | .tagName
@@ -78,90 +82,82 @@ jobs:
           if [ -z "$TO_DELETE" ]; then
             echo "无需删除（实际数量 ≤ $RETAIN）"
           else
-            echo "待删除的 tag_names（及其 Release）："
-            echo "$TO_DELETE" | tr ' ' '\n' || echo "$TO_DELETE"
+            echo "即将删除以下 Release 的 tag_name："
+            echo "$TO_DELETE" | sort || echo "$TO_DELETE"
 
-            echo "$TO_DELETE" | while read -r tag; do
+            while IFS= read -r tag; do
               [ -z "$tag" ] && continue
               echo "删除 Release + Tag: $tag"
               for try in {1..3}; do
-                gh release delete "$tag" --cleanup-tag --yes && {
+                if gh release delete "$tag" --cleanup-tag --yes; then
                   echo "成功删除 $tag"
                   break
-                }
+                fi
                 echo "尝试 $try/3 失败，重试..."
                 sleep $((try * 3))
-              done || echo "删除 $tag 失败（可能已不存在或权限问题）"
-            done
+              done || echo "警告：删除 $tag 失败（可能已不存在或权限不足）"
+            done <<< "$TO_DELETE"
           fi
 
-      - name: 清理孤立 Tags（不属于任何 Release 的 ImmortalWrt-24.10 tag）
+      - name: 清理孤立 Tags
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
 
-          echo "获取所有 ImmortalWrt-24.10 Tags..."
+          echo "获取所有匹配的 Tags..."
           TAGS_JSON=$(gh api --paginate repos/${{ github.repository }}/tags --jq '
             map(select(.name | test("immortalwrt-24.10"; "i")))
-          ') || {
-            echo "获取 Tags 失败"
-            exit 1
-          }
+          ') || exit 1
 
           TAG_COUNT=$(echo "$TAGS_JSON" | jq 'length' || echo 0)
-          echo "找到 $TAG_COUNT 个匹配的 Tags"
+          echo "找到 $TAG_COUNT 个匹配 Tags"
 
           if [ "$TAG_COUNT" -eq 0 ]; then
-            echo "没有匹配的 Tag，跳过"
+            echo "没有匹配 Tag，跳过"
             exit 0
           fi
 
-          # 当前所有 Release 的 tag_name（已保留或全部）
           CURRENT_TAGS=$(gh release list --json tagName --jq '.[].tagName' | sort -u || echo "")
 
-          echo "当前 Release 关联的 Tags："
-          echo "$CURRENT_TAGS" || echo "无"
-
-          # 找出孤立 tag
-          TO_DELETE_TAGS=$(echo "$TAGS_JSON" | jq -r --argjson current "$(echo "$CURRENT_TAGS" | jq -R .)" '
+          TO_DELETE_TAGS=$(echo "$TAGS_JSON" | jq -r --argjson curr "$CURRENT_TAGS" '
             .[] | .name as $n |
-            if ($current | index($n)) then empty else $n end
+            if ($curr | contains($n)) then empty else $n end
           ' || echo "")
 
           if [ -z "$TO_DELETE_TAGS" ]; then
-            echo "没有孤立 Tag 需要删除"
+            echo "没有孤立 Tag"
           else
-            echo "待删除的孤立 Tags："
-            echo "$TO_DELETE_TAGS" | tr ' ' '\n'
+            echo "即将删除孤立 Tags："
+            echo "$TO_DELETE_TAGS" | sort
 
-            echo "$TO_DELETE_TAGS" | while read -r tag; do
+            while IFS= read -r tag; do
               [ -z "$tag" ] && continue
               echo "删除 Tag: $tag"
               for try in {1..4}; do
-                gh api -X DELETE "repos/${{ github.repository }}/git/refs/tags/$tag" && {
-                  echo "成功删除 $tag"
+                if gh api -X DELETE "repos/${{ github.repository }}/git/refs/tags/$tag"; then
+                  echo "成功"
                   break
-                }
+                fi
                 echo "尝试 $try/4 失败，重试..."
                 sleep $((try * 4))
-              done || echo "删除 Tag $tag 失败（可能已不存在）"
-            done
+              done || echo "删除 $tag 失败"
+            done <<< "$TO_DELETE_TAGS"
           fi
 
-      - name: 显示最终状态（验证）
+      - name: 显示最终状态
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          echo "=== 清理完成后状态 ==="
-          echo "剩余 ImmortalWrt-24.10 Releases（前10个）："
-          gh release list --json name,tagName,createdAt --limit 10 --jq '
+          echo "=== 清理后状态 ==="
+          echo "剩余 Releases（前10）："
+          gh release list --limit 10 --json name,tagName,createdAt --jq '
             sort_by(.createdAt) | reverse |
             map(select(.name | test("ImmortalWrt-24.10"; "i")))
-          ' || echo "无"
+          ' || echo "无剩余 Release"
 
-          echo -e "\n剩余 ImmortalWrt-24.10 Tags（前10个）："
+          echo -e "\n剩余 Tags（前10）："
           gh api repos/${{ github.repository }}/tags --jq '
             map(select(.name | test("immortalwrt-24.10"; "i"))) |
-            sort_by(.commit.author.date) | reverse | .[:10] | .[].name
-          ' || echo "无"
+            sort_by(.commit.author.date) | reverse | .[:10] | .[].name // "无"
+          '
