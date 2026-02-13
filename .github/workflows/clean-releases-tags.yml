@@ -1,273 +1,153 @@
-name: 清理旧发布和标签
+name: 清理旧发布和标签 (ImmortalWrt-24.10)
+
 on:
   workflow_dispatch:
     inputs:
       confirm_cleanup:
-        description: '确认执行清理操作'
+        description: '确认执行清理操作（必须勾选）'
         type: boolean
         required: true
         default: false
       retain_count:
-        description: '保留的 Release 和 Tag 数量（默认 0）'
+        description: '保留最新的 Release 和 Tag 数量（0 = 全删，建议 3~10）'
         type: string
         required: false
-        default: '0'
+        default: '3'
+
 permissions:
-  contents: write
+  contents: write   # 必须有 write 权限才能删除 release 和 tag
+
 jobs:
-  clean-releases-tags:
+  clean-old-releases-and-tags:
     runs-on: ubuntu-latest
     if: github.event.inputs.confirm_cleanup == 'true'
+
     steps:
-      - name: 检出仓库
+      - name: 检出代码（其实这里不需要，但保持习惯）
         uses: actions/checkout@v4
-      - name: 安装 GitHub CLI (gh) 和 jq
+
+      - name: 安装必要工具
         run: |
           sudo apt-get update
           sudo apt-get install -y gh jq
           gh --version
           jq --version
-      - name: 验证保留数量
-        id: validate
+
+      - name: 解析并验证保留数量
+        id: set-retain
         run: |
-          RETAIN_COUNT="${{ github.event.inputs.retain_count }}"
-          if [[ ! "$RETAIN_COUNT" =~ ^[0-9]+$ ]]; then
-            echo "错误：保留数量 '$RETAIN_COUNT' 无效，使用默认值 0"
-            RETAIN_COUNT=0
-          elif [ "$RETAIN_COUNT" -lt 0 ]; then
-            echo "错误：保留数量不能为负数，使用默认值 0"
-            RETAIN_COUNT=0
+          RETAIN="${{ github.event.inputs.retain_count }}"
+          if ! [[ "$RETAIN" =~ ^[0-9]+$ ]] || [ "$RETAIN" -lt 0 ]; then
+            echo "输入的保留数量无效（$RETAIN），强制使用 3"
+            RETAIN=3
           fi
-          echo "retain_count=$RETAIN_COUNT" >> $GITHUB_OUTPUT
-          echo "验证完成，保留数量：$RETAIN_COUNT"
-      - name: 清理旧 Releases
+          echo "retain=$RETAIN" >> $GITHUB_OUTPUT
+          echo "将保留最新的 $RETAIN 个 Release / Tag"
+
+      - name: 清理旧 Releases（并自动删除关联 Tag）
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          set -e
-          RETAIN_COUNT=${{ steps.validate.outputs.retain_count }}
-          echo "正在列出所有包含 ImmortalWrt-24.10 的 Releases..."
-          # 分页获取所有 Releases，按创建时间降序
-          RELEASES=""
-          PAGE=1
-          while true; do
-            PAGE_RELEASES_OUTPUT=$(gh api -H "Accept: application/vnd.github+json" repos/${{ github.repository }}/releases?page=$PAGE&per_page=100 2>&1)
-            if [[ "$PAGE_RELEASES_OUTPUT" == *"422"* ]] || [[ "$PAGE_RELEASES_OUTPUT" == *"10000"* ]]; then
-              echo "警告：GitHub API 限额 10,000 条已达，无法获取更多 Releases。已处理前 $((PAGE * 100)) 条。"
-              break
-            fi
-            PAGE_RELEASES=$(echo "$PAGE_RELEASES_OUTPUT" | jq -r '.[] | select(.name | test("ImmortalWrt-24.10")) | .name')
-            if [ -z "$PAGE_RELEASES" ]; then
-              break
-            fi
-            RELEASES="$RELEASES\n$PAGE_RELEASES"
-            ((PAGE++))
-          done
-          RELEASES=$(echo -e "$RELEASES" | grep -v '^$' | uniq)
-          if [ -z "$RELEASES" ]; then
-            echo "未找到包含 ImmortalWrt-24.10 的 Releases，跳过清理"
+          set -euo pipefail
+
+          RETAIN=${{ steps.set-retain.outputs.retain }}
+
+          echo "获取所有 ImmortalWrt-24.10 相关的 Releases（按创建时间降序）..."
+          # 使用 gh release list + json 更可靠，也支持 --limit
+          RELEASE_JSON=$(gh release list --json tagName,name,createdAt --jq '
+            sort_by(.createdAt) | reverse |
+            map(select(.name | test("ImmortalWrt-24.10"; "i")))
+          ' --limit 500)  # 一般够用，如超多可再分页
+
+          if [ "$(echo "$RELEASE_JSON" | jq length)" -eq 0 ]; then
+            echo "没有找到符合条件的 Release，跳过"
             exit 0
           fi
-          echo "找到的 Releases（按时间降序）："
-          echo "$RELEASES"
-         
-          # 根据 retain_count 保留指定数量的 Releases（前N个是最新的）
-          if [ "$RETAIN_COUNT" -eq 0 ]; then
-            TO_DELETE=$(echo "$RELEASES" | tr '\n' '\n')
-          else
-            TO_DELETE=$(echo "$RELEASES" | tail -n +$((RETAIN_COUNT + 1)))
-          fi
-         
+
+          echo "找到的 Releases（最新在前）："
+          echo "$RELEASE_JSON" | jq -r '.[].name'
+
+          # 待删除的 Releases（从第 RETAIN+1 个开始）
+          TO_DELETE=$(echo "$RELEASE_JSON" | jq -r '.[env.RETAIN | tonumber:] | .[].tagName')
+
           if [ -z "$TO_DELETE" ]; then
-            echo "无需删除 Releases（保留数量：$RETAIN_COUNT）"
+            echo "无需删除任何 Release（已 ≤ $RETAIN 个）"
           else
-            echo "待删除的 Releases："
-            echo "$TO_DELETE"
-            for RELEASE in $TO_DELETE; do
-              if [ -n "$RELEASE" ]; then
-                echo "删除 Release：$RELEASE"
-                for attempt in {1..3}; do
-                  gh release delete "$RELEASE" --repo ${{ github.repository }} --yes && break
-                  echo "警告：删除 Release $RELEASE 失败，重试 $attempt/3"
-                  sleep $((attempt * 5))
-                done || echo "错误：无法删除 Release $RELEASE"
+            echo "即将删除以下 Release（及其 Tag）："
+            echo "$TO_DELETE" | tr ' ' '\n'
+
+            echo "$TO_DELETE" | while read -r tag; do
+              if [ -n "$tag" ]; then
+                echo "删除 Release + Tag: $tag"
+                for try in {1..3}; do
+                  gh release delete "$tag" --cleanup-tag --yes && break
+                  echo "第 $try 次失败，重试..."
+                  sleep $((try*3))
+                done || echo "!!! 删除 $tag 失败，请手动检查"
               fi
             done
           fi
-      - name: 清理旧 Tags
+
+      - name: 清理孤立 Tags（不关联任何 Release 的 ImmortalWrt-24.10 tag）
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        shell: bash
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          set -e
-          RETAIN_COUNT=${{ steps.validate.outputs.retain_count }}
-          echo "正在列出所有包含 ImmortalWrt-24.10 的 Tags..."
-          # 使用分页获取所有 Tags，按时间降序
-          TAGS=""
-          PAGE=1
-          while true; do
-            PAGE_TAGS_OUTPUT=$(gh api -H "Accept: application/vnd.github+json" repos/${{ github.repository }}/tags?page=$PAGE&per_page=100 2>&1)
-            if [[ "$PAGE_TAGS_OUTPUT" == *"422"* ]] || [[ "$PAGE_TAGS_OUTPUT" == *"10000"* ]]; then
-              echo "警告：GitHub API 限额 10,000 条已达，无法获取更多 Tags。已处理前 $((PAGE * 100)) 条。"
-              break
-            fi
-            PAGE_TAGS=$(echo "$PAGE_TAGS_OUTPUT" | jq -r '.[] | select(.name | test("(?i)immortalwrt-24.10")) | .name')
-            if [ -z "$PAGE_TAGS" ]; then
-              break
-            fi
-            TAGS="$TAGS $PAGE_TAGS"
-            ((PAGE++))
-          done
-          TAGS=$(echo "$TAGS" | tr ' ' '\n' | grep -v '^$' | uniq)
-          if [ -z "$TAGS" ]; then
-            echo "未找到包含 ImmortalWrt-24.10 的 Tags，跳过清理"
+          set -euo pipefail
+
+          echo "获取所有 ImmortalWrt-24.10 相关的 Tags..."
+          TAGS_JSON=$(gh api repos/${{ github.repository }}/tags --paginate --jq '
+            sort_by(.commit.author.date) | reverse |
+            map(select(.name | test("immortalwrt-24.10"; "i")))
+          ')
+
+          if [ "$(echo "$TAGS_JSON" | jq length)" -eq 0 ]; then
+            echo "没有找到符合条件的 Tag，跳过"
             exit 0
           fi
-          echo "找到的 Tags（按时间降序）："
-          echo "$TAGS"
-         
-          # 获取保留的 Releases 对应的实际 Tag 名称
-          RETAINED_RELEASES=$(gh api -H "Accept: application/vnd.github+json" repos/${{ github.repository }}/releases?per_page=$RETAIN_COUNT | jq -r '.[] | select(.name | test("ImmortalWrt-24.10")) | .tag_name')
-          RETAINED_TAGS=$(echo "$RETAINED_RELEASES" | tr '\n' ' ' | grep -v '^$' | uniq)
-          echo "保留的 Releases 对应的 Tags："
-          echo "$RETAINED_TAGS"
-         
-          # 使用数组构建待删除 Tags 列表，避免重复
-          declare -a TO_DELETE_TAGS
-          while IFS= read -r TAG; do
-            if [ -n "$TAG" ] && ! echo "$RETAINED_TAGS" | grep -q "^$TAG$"; then
-              if [[ ! " ${TO_DELETE_TAGS[*]} " =~ " $TAG " ]]; then
-                TO_DELETE_TAGS+=("$TAG")
-                echo "添加待删除 Tag：$TAG"
-              fi
+
+          # 当前剩余的 Release tags（已保留的）
+          CURRENT_RELEASE_TAGS=$(gh release list --json tagName --jq '.[].tagName' | sort | uniq)
+
+          echo "当前存在的 Release 关联的 Tags："
+          echo "$CURRENT_RELEASE_TAGS"
+
+          # 找出需要删除的孤立 tag
+          TO_DELETE_TAGS=""
+          while read -r tag; do
+            if ! echo "$CURRENT_RELEASE_TAGS" | grep -q "^$tag$"; then
+              TO_DELETE_TAGS="$TO_DELETE_TAGS $tag"
             fi
-          done <<< "$TAGS"
-         
-          if [ ${#TO_DELETE_TAGS[@]} -eq 0 ]; then
-            echo "无需删除 Tags（所有 Tags 均对应保留的 Releases）"
+          done < <(echo "$TAGS_JSON" | jq -r '.[].name')
+
+          if [ -z "$TO_DELETE_TAGS" ]; then
+            echo "没有孤立的 Tag 需要清理"
           else
-            echo "待删除的 Tags："
-            printf '%s\n' "${TO_DELETE_TAGS[@]}"
-            for TAG in "${TO_DELETE_TAGS[@]}"; do
-              echo "删除 Tag：$TAG"
-              for attempt in {1..5}; do
-                gh api -X DELETE -H "Accept: application/vnd.github+json" repos/${{ github.repository }}/git/refs/tags/$TAG && break
-                echo "警告：删除 Tag $TAG 失败，重试 $attempt/5"
-                sleep $((attempt * 5))
-              done || echo "错误：无法删除 Tag $TAG"
+            echo "即将删除以下孤立 Tags："
+            echo "$TO_DELETE_TAGS" | tr ' ' '\n'
+
+            for tag in $TO_DELETE_TAGS; do
+              echo "删除 Tag: $tag"
+              for try in {1..4}; do
+                gh api -X DELETE "repos/${{ github.repository }}/git/refs/tags/$tag" && break
+                echo "第 $try 次失败，重试..."
+                sleep $((try*4))
+              done || echo "!!! 删除 Tag $tag 失败"
             done
           fi
-          echo "Tags 清理完成"
-      - name: 验证清理结果
+
+      - name: 输出最终状态（验证用）
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          set -e
-          RETAIN_COUNT=${{ steps.validate.outputs.retain_count }}
-          echo "验证剩余的 Releases..."
-          # 分页获取剩余 Releases
-          REMAINING_RELEASES=""
-          PAGE=1
-          while true; do
-            PAGE_RELEASES_OUTPUT=$(gh api -H "Accept: application/vnd.github+json" repos/${{ github.repository }}/releases?page=$PAGE&per_page=100 2>&1)
-            if [[ "$PAGE_RELEASES_OUTPUT" == *"422"* ]] || [[ "$PAGE_RELEASES_OUTPUT" == *"10000"* ]]; then
-              echo "警告：GitHub API 限额 10,000 条已达，无法验证更多 Releases。"
-              break
-            fi
-            PAGE_RELEASES=$(echo "$PAGE_RELEASES_OUTPUT" | jq -r '.[] | select(.name | test("ImmortalWrt-24.10")) | .name')
-            if [ -z "$PAGE_RELEASES" ]; then
-              break
-            fi
-            REMAINING_RELEASES="$REMAINING_RELEASES\n$PAGE_RELEASES"
-            ((PAGE++))
-          done
-          REMAINING_RELEASES=$(echo -e "$REMAINING_RELEASES" | grep -v '^$' | uniq)
-          REMAINING_COUNT=$(echo "$REMAINING_RELEASES" | wc -l)
-          echo "剩余 Releases（总数：$REMAINING_COUNT）："
-          echo "$REMAINING_RELEASES" || echo "无剩余 Releases"
-          if [ "$RETAIN_COUNT" -eq 0 ] && [ "$REMAINING_COUNT" -gt 0 ]; then
-            echo "错误：仍有 $REMAINING_COUNT 个 Releases 未删除"
-            exit 1
-          elif [ "$RETAIN_COUNT" -gt 0 ] && [ "$REMAINING_COUNT" -gt "$RETAIN_COUNT" ]; then
-            echo "错误：剩余 Releases 数量 ($REMAINING_COUNT) 超过预期 ($RETAIN_COUNT)"
-            exit 1
-          fi
-         
-          echo "验证剩余的 Tags..."
-          REMAINING_TAGS=""
-          PAGE=1
-          while true; do
-            PAGE_TAGS_OUTPUT=$(gh api -H "Accept: application/vnd.github+json" repos/${{ github.repository }}/tags?page=$PAGE&per_page=100 2>&1)
-            if [[ "$PAGE_TAGS_OUTPUT" == *"422"* ]] || [[ "$PAGE_TAGS_OUTPUT" == *"10000"* ]]; then
-              echo "警告：GitHub API 限额 10,000 条已达，无法验证更多 Tags。"
-              break
-            fi
-            PAGE_TAGS=$(echo "$PAGE_TAGS_OUTPUT" | jq -r '.[] | select(.name | test("(?i)immortalwrt-24.10")) | .name')
-            if [ -z "$PAGE_TAGS" ]; then
-              break
-            fi
-            REMAINING_TAGS="$REMAINING_TAGS $PAGE_TAGS"
-            ((PAGE++))
-          done
-          REMAINING_TAGS=$(echo "$REMAINING_TAGS" | tr ' ' '\n' | grep -v '^$' | sort -r | uniq)
-          REMAINING_TAGS_COUNT=$(echo "$REMAINING_TAGS" | wc -l)
-          echo "剩余 Tags（总数：$REMAINING_TAGS_COUNT）："
-          echo "$REMAINING_TAGS" || echo "无剩余 Tags"
-          if [ "$RETAIN_COUNT" -eq 0 ] && [ "$REMAINING_TAGS_COUNT" -gt 0 ]; then
-            echo "错误：仍有 $REMAINING_TAGS_COUNT 个 Tags 未删除"
-            echo "建议：检查残留 Tags ($REMAINING_TAGS)，可能需手动删除或调整权限"
-            exit 1
-          elif [ "$RETAIN_COUNT" -gt 0 ] && [ "$REMAINING_TAGS_COUNT" -gt "$RETAIN_COUNT" ]; then
-            echo "错误：剩余 Tags 数量 ($REMAINING_TAGS_COUNT) 超过预期 ($RETAIN_COUNT)"
-            echo "建议：检查残留 Tags ($REMAINING_TAGS)，可能需手动删除或调整权限"
-            exit 1
-          fi
-          echo "清理结果验证通过"
-      - name: 输出清理结果
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          RETAIN_COUNT=${{ steps.validate.outputs.retain_count }}
-          echo "清理操作完成！"
-          echo "保留的 Releases（最多 $RETAIN_COUNT 个）："
-          # 分页获取保留的 Releases
-          RETAINED_RELEASES=""
-          PAGE=1
-          while true; do
-            PAGE_RELEASES_OUTPUT=$(gh api -H "Accept: application/vnd.github+json" repos/${{ github.repository }}/releases?page=$PAGE&per_page=100 2>&1)
-            if [[ "$PAGE_RELEASES_OUTPUT" == *"422"* ]] || [[ "$PAGE_RELEASES_OUTPUT" == *"10000"* ]]; then
-              echo "警告：GitHub API 限额 10,000 条已达，无法获取更多保留 Releases。"
-              break
-            fi
-            PAGE_RELEASES=$(echo "$PAGE_RELEASES_OUTPUT" | jq -r '.[] | select(.name | test("ImmortalWrt-24.10")) | .name')
-            if [ -z "$PAGE_RELEASES" ]; then
-              break
-            fi
-            RETAINED_RELEASES="$RETAINED_RELEASES\n$PAGE_RELEASES"
-            if [ $(echo "$RETAINED_RELEASES" | wc -l) -ge $((RETAIN_COUNT + 1)) ]; then
-              break
-            fi
-            ((PAGE++))
-          done
-          echo -e "$RETAINED_RELEASES" | head -n $RETAIN_COUNT || echo "无保留的 Releases"
-          echo "保留的 Tags："
-          # 分页获取保留的 Tags
-          RETAINED_TAGS=""
-          PAGE=1
-          while true; do
-            PAGE_TAGS_OUTPUT=$(gh api -H "Accept: application/vnd.github+json" repos/${{ github.repository }}/tags?page=$PAGE&per_page=100 2>&1)
-            if [[ "$PAGE_TAGS_OUTPUT" == *"422"* ]] || [[ "$PAGE_TAGS_OUTPUT" == *"10000"* ]]; then
-              echo "警告：GitHub API 限额 10,000 条已达，无法获取更多保留 Tags。"
-              break
-            fi
-            PAGE_TAGS=$(echo "$PAGE_TAGS_OUTPUT" | jq -r '.[] | select(.name | test("(?i)immortalwrt-24.10")) | .name')
-            if [ -z "$PAGE_TAGS" ]; then
-              break
-            fi
-            RETAINED_TAGS="$RETAINED_TAGS $PAGE_TAGS"
-            if [ $(echo "$RETAINED_TAGS" | tr ' ' '\n' | wc -l) -ge $RETAIN_COUNT ]; then
-              break
-            fi
-            ((PAGE++))
-          done
-          echo "$RETAINED_TAGS" | tr ' ' '\n' | head -n $RETAIN_COUNT | tr '\n' ' ' || echo "无保留的 Tags"
+          echo "=== 清理后状态 ==="
+          echo "剩余 Releases:"
+          gh release list --json name,tagName,createdAt --jq '
+            sort_by(.createdAt) | reverse |
+            map(select(.name | test("ImmortalWrt-24.10"; "i"))) | .[:10]
+          ' || echo "无"
+
+          echo -e "\n剩余 Tags (前10个):"
+          gh api repos/${{ github.repository }}/tags --jq '
+            sort_by(.commit.author.date) | reverse |
+            map(select(.name | test("immortalwrt-24.10"; "i"))) | .[:10] | .[].name
+          ' || echo "无"
