@@ -23,7 +23,7 @@ env:
   FEEDS_CONF: feeds.conf.default
   CONFIG_FILE: 24.10-6.6.config
   DIY_P1_SH: scripts/diy-part1.sh
-  DIY_P2_SH: scripts/diy-part2.sh
+  DIY_P2_SH: scripts/diy-part3.sh
   TZ: Asia/Shanghai
   # WebDAV 配置（需在仓库 Settings -> Secrets 中添加）
   WEBDAV_URL: ${{ secrets.WEBDAV_URL }}
