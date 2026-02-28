@@ -82,23 +82,30 @@ jobs:
           make defconfig
           make download -j8
 
-      - name: 修改 5G 功率 (25dB)
+      - name: 使用自定义 MT7981 EEPROM 文件覆盖 (25dB)
         if: github.event.inputs.enable_5g_25db == 'true'
         run: |
           cd openwrt
-          # 只对 MT7981 系列设备生效
+          
+          # 只对 MT7981 设备生效
           if [[ "${{ github.event.inputs.device_model }}" =~ (ax3000t|rax3000m|mt3000) ]]; then
-            FILE="package/mtk/drivers/mt_wifi/files/mt7981-default-eeprom/MT7981_iPAiLNA_EEPROM.bin"
-            if [ -f "$FILE" ]; then
-              printf '\x2B\x2B\x2B\x2B\x2B\x2B\x2B\x2B\x2B\x2B\x2B\x2B\x2B\x2B\x2B\x2B\x2B\x2B\x2B\x2B' | dd of="$FILE" bs=1 seek=$((0x445)) conv=notrunc
-              echo "✅ 5G 功率已修改为 25dB"
+            SRC_FILE="$GITHUB_WORKSPACE/files/MT7981_iPAiLNA_EEPROM.bin"
+            DEST_FILE="package/mtk/drivers/mt_wifi/files/mt7981-default-eeprom/MT7981_iPAiLNA_EEPROM.bin"
+            
+            if [ -f "$SRC_FILE" ]; then
+              mkdir -p "$(dirname "$DEST_FILE")"
+              cp -f "$SRC_FILE" "$DEST_FILE"
+              echo "✅ 成功使用自定义 MT7981_iPAiLNA_EEPROM.bin 覆盖系统文件"
+              ls -lh "$DEST_FILE"
+              echo "文件大小: $(stat -c %s "$DEST_FILE" 2>/dev/null || echo '未知') 字节"
             else
-              echo "⚠️ 找不到 MT7981 EEPROM 文件"
+              echo "❌ 未找到自定义文件：$SRC_FILE"
+              echo "   请确认仓库中存在 files/MT7981_iPAiLNA_EEPROM.bin"
+              exit 1   # 让构建失败，提醒你文件没放对
             fi
           else
-            echo "ℹ️ 当前设备非 MT7981，跳过 5G 修改"
+            echo "ℹ️ 当前设备非 MT7981，跳过 EEPROM 替换"
           fi
-
       - name: 编译固件
         run: |
           cd openwrt
