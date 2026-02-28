@@ -92,37 +92,32 @@ jobs:
           ./scripts/feeds update -a && ./scripts/feeds install -a
           chmod +x $GITHUB_WORKSPACE/$DIY_P2_SH && $GITHUB_WORKSPACE/$DIY_P2_SH
 
-      - name: 自动注入 25dB EEPROM 修改 (2.4G & 5G 统一 25dB)
+      - name: 强制注入高功率 EEPROM 
         if: github.event.inputs.enable_5g_25db == 'true'
         run: |
-          cd openwrt
-          # 定义目标文件名
+          # 1. 定义源文件位置（你仓库里的文件）
+          SOURCE_EEPROM="$GITHUB_WORKSPACE/files/MT7981_iPAiLNA_EEPROM.bin"
           TARGET_NAME="MT7981_iPAiLNA_EEPROM.bin"
-          
-          if [[ "${{ github.event.inputs.device_model }}" =~ (ax3000t|rax3000m|mt3000) ]]; then
-            echo "🔍 正在源码目录中搜索 $TARGET_NAME..."
-            
-            # 使用 find 寻找所有匹配的文件路径
-            TARGET_FILES=$(find . -name "$TARGET_NAME")
-            
-            if [ -z "$TARGET_FILES" ]; then
-              echo "❌ 错误：在整个 openwrt 目录下都未找到 $TARGET_NAME"
-              echo "目前目录下的文件结构参考（前2级）："
-              ls -R package/mtk 2>/dev/null | head -n 20
-              exit 1
-            fi
-            
-            for FILE_PATH in $TARGET_FILES; do
-              echo "Found: $FILE_PATH"
-              # 执行注入：从 0x441 开始覆盖 20 个字节为 0x2F (25dB) 
-              printf '\x2F\x2F\x2F\x2F\x2F\x2F\x2F\x2F\x2F\x2F\x2F\x2F\x2F\x2F\x2F\x2F\x2F\x2F\x2F\x2F' | \
-              dd of="$FILE_PATH" bs=1 seek=$((0x441)) conv=notrunc
-              
-              echo "✅ 已成功修改: $FILE_PATH"
-              # 验证修改结果 [cite: 6]
-              hexdump -v -C -s 0x441 -n 16 "$FILE_PATH"
-            done
+
+          if [ ! -f "$SOURCE_EEPROM" ]; then
+            echo "❌ 错误：未在 files/ 目录下找到 $TARGET_NAME"
+            exit 1
           fi
+
+          # 2. 强制修正文件标识位 (0x04 偏移)，确保避开 00:0c
+          # 这是为了让固件启动时的 caldata_validate 直接通过，不触发重新提取
+          printf '\x34\xca' | dd of="$SOURCE_EEPROM" bs=1 seek=4 conv=notrunc
+
+          # 3. 寻找源码中所有同名文件并强制替换
+          cd openwrt
+          find . -name "$TARGET_NAME" -exec cp -f "$SOURCE_EEPROM" {} \;
+
+          # 4. 兜底策略：如果源码中原本没有这个文件，手动放入驱动目录
+          # 这样编译时它会被打包进固件的 /lib/firmware/
+          mkdir -p package/mtk/drivers/mt7981-firmware/files/
+          cp -f "$SOURCE_EEPROM" package/mtk/drivers/mt7981-firmware/files/$TARGET_NAME
+
+          echo "✅ 高功率 EEPROM 已强制覆盖到源码"
 
       - name: 生成 .config & 强韧下载软件包
         run: |
