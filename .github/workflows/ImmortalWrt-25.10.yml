@@ -92,6 +92,38 @@ jobs:
           ./scripts/feeds update -a && ./scripts/feeds install -a
           chmod +x $GITHUB_WORKSPACE/$DIY_P2_SH && $GITHUB_WORKSPACE/$DIY_P2_SH
 
+      - name: 自动注入 25dB EEPROM 修改 (2.4G & 5G 统一 25dB)
+        if: github.event.inputs.enable_5g_25db == 'true'
+        run: |
+          cd openwrt
+          # 定义目标文件名
+          TARGET_NAME="MT7981_iPAiLNA_EEPROM.bin"
+          
+          if [[ "${{ github.event.inputs.device_model }}" =~ (ax3000t|rax3000m|mt3000) ]]; then
+            echo "🔍 正在源码目录中搜索 $TARGET_NAME..."
+            
+            # 使用 find 寻找所有匹配的文件路径
+            TARGET_FILES=$(find . -name "$TARGET_NAME")
+            
+            if [ -z "$TARGET_FILES" ]; then
+              echo "❌ 错误：在整个 openwrt 目录下都未找到 $TARGET_NAME"
+              echo "目前目录下的文件结构参考（前2级）："
+              ls -R package/mtk 2>/dev/null | head -n 20
+              exit 1
+            fi
+            
+            for FILE_PATH in $TARGET_FILES; do
+              echo "Found: $FILE_PATH"
+              # 执行注入：从 0x441 开始覆盖 20 个字节为 0x2F (25dB) 
+              printf '\x2F\x2F\x2F\x2F\x2F\x2F\x2F\x2F\x2F\x2F\x2F\x2F\x2F\x2F\x2F\x2F\x2F\x2F\x2F\x2F' | \
+              dd of="$FILE_PATH" bs=1 seek=$((0x441)) conv=notrunc
+              
+              echo "✅ 已成功修改: $FILE_PATH"
+              # 验证修改结果 [cite: 6]
+              hexdump -v -C -s 0x441 -n 16 "$FILE_PATH"
+            done
+          fi
+
       - name: 生成 .config & 强韧下载软件包
         run: |
           cd openwrt
@@ -106,39 +138,6 @@ jobs:
           
           make defconfig
           make download -j8 || make download -j1 V=s
-
-      - name: 自动注入 25dB EEPROM 修改 (2.4G & 5G 统一 25dB)
-        if: github.event.inputs.enable_5g_25db == 'true'
-        run: |
-          cd openwrt
-          # 定义目标路径（MTK 驱动源码中 EEPROM 的存放位置）
-          DEST_DIR="package/mtk/drivers/mt_wifi/files/mt7981-default-eeprom"
-          DEST_FILE="$DEST_DIR/MT7981_iPAiLNA_EEPROM.bin"
-          
-          if [[ "${{ github.event.inputs.device_model }}" =~ (ax3000t|rax3000m|mt3000) ]]; then
-            echo "正在为 ${{ github.event.inputs.device_model }} 生成高功率 EEPROM..."
-            
-            # 确保目录存在
-            mkdir -p "$DEST_DIR"
-            
-            # 如果源码中已经有这个文件，我们就地修改它；如果没有，就创建一个空的再修改
-            # 或者更稳妥的做法：直接用 printf 生成一个完整的 25dB 字节流覆盖它
-            # 这里我们采用对现有文件进行精确地址覆盖（seek=0x441）
-            
-            if [ -f "$DEST_FILE" ]; then
-              # 使用你之前验证过的命令：从 0x441 开始写入 20 个字节的 0x2F (26dB)
-              printf '\x2F\x2F\x2F\x2F\x2F\x2F\x2F\x2F\x2F\x2F\x2F\x2F\x2F\x2F\x2F\x2F\x2F\x2F\x2F\x2F' | \
-              dd of="$DEST_FILE" bs=1 seek=$((0x441)) conv=notrunc
-              
-              echo "✅ EEPROM 修改完成！"
-              echo "验证结果 (0x441 处前 16 字节):"
-              hexdump -C "$DEST_FILE" -s 0x441 -n 16
-            else
-              echo "⚠️ 警告：在源码路径下未找到默认 EEPROM 文件，请检查驱动路径是否正确。"
-              # 如果路径不匹配，你可以用 find 命令搜一下：
-              # find . -name "MT7981_iPAiLNA_EEPROM.bin"
-            fi
-          fi
 
       - name: 编译固件 (多核全开)
         run: |
