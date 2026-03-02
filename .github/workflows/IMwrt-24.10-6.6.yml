@@ -48,7 +48,7 @@ on:
         description: '源代码仓库分支'
         default: 'openwrt-24.10-6.6'
   schedule:
-    - cron: '0 7 * * 5'  # 每周五07:00 UTC（北京时间15:00）
+    - cron: '35 5 * * 1'   # 每周一 05:35 UTC（北京时间 13:35）
 
 permissions:
   contents: write
